@@ -1,0 +1,2209 @@
+---
+title: "NYC Public Restroom Analysis"
+author: "Chaeyeon Lee"
+date: "2025-11-17"
+
+format:
+  html:
+    self-contained: true
+    theme: default
+    toc: true
+    code-tools: true
+    code-fold: true
+    code-summary: "Code"
+
+jupyter: python3
+---
+
+
+
+<style>
+.quarto-title-meta {
+  margin-bottom: 3rem;  
+}
+</style>
+
+## Introduction
+
+New York City, despite being a major global center of tourism and commerce, continues to experience persistent challenges stemming from a limited supply of accessible public restrooms in everyday urban environments. Existing discussions often remain at an intuitive level, focusing primarily on the general perception that the number of available restrooms is insufficient. However, data-driven analyses that identify the specific locations, severity, and underlying criteria of restroom shortages remain relatively scarce.
+
+To address this gap, the present analysis examines disparities in public restroom provision across the five boroughs of New York City (Bronx, Brooklyn, Manhattan, Queens, and Staten Island) and identifies the areas most urgently requiring additional facilities.
+
+A composite indicator, referred to as the Priority Score, is constructed to evaluate restroom insufficiency through the integration of three factors: population density, accessibility to existing restrooms, and the degree of restroom shortage relative to population. Based on this metric, census tracts with particularly inadequate restroom availability are identified, after which the five highest-priority tracts are selected for further examination. Within each tract, a p-median (p = 1) spatial optimization model is applied using the spatial distribution of key community facilities, including subway stations, bus stops, schools, parks, NYCHA developments, and social service centers, in order to determine the most effective locations for new public restroom installations.
+
+Finally, the improvement in accessibility resulting from the proposed installations is quantitatively assessed by comparing the distance to the nearest existing restroom (Before) with the distance after the inclusion of the optimized facility (After). This comparison provides a clear evaluation of the potential impact of the recommended restroom placement.
+
+## Data and Preprocessing
+
+### Data Sources
+
+This analysis combines several datasets related to public restrooms, population, administrative boundaries, and community facilities in New York City:
+
+1. **Public Restrooms**
+   - NYC Open Data: `Public_Restrooms.csv`
+   - Contains location (latitude/longitude) and facility attributes.
+
+2. **Administrative Boundaries & Population**
+   - TIGER/Line 2023 Tract Shapefile: `tl_2023_36_tract.shp`
+   - ACS 5-year (2023) total population from the Census API  
+     (variable `B01003_001E` – total population).
+
+3. **Additional Community Facilities (used later in the analysis)**
+   - MTA Subway Stations (`MTA_Subway_Stations.csv`)
+   - MTA Bus Stops (`MTA_Bus_Stops.csv`)
+   - NYCHA Facilities (`NYCHA_Facilities_and_Service_Centers.csv`)
+   - School points (shapefile)
+   - Parks polygons (`Parks_Zones.csv`)
+   - NYC Facilities Database (`Facilities_Database.csv`), from which
+     welfare-related categories (ADULT SERVICES, HUMAN SERVICES,
+     CHILD SERVICES AND WELFARE, YOUTH SERVICES) are selected.
+
+4. **Study Area**
+   - State: `STATEFP = 36` (New York State)
+   - Counties: `{005, 047, 061, 081, 085}` corresponding to
+     Bronx, Brooklyn, Manhattan, Queens, and Staten Island.
+
+
+
+```{python}
+#| label: data-preprocessing
+#| code-fold: true
+#| echo: true
+
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import numpy as np
+import requests
+from pathlib import Path
+
+# Base paths and configuration
+BASE_DIR = Path.cwd()
+
+RESTROOM_CSV_PATH = BASE_DIR / "Public_Restrooms.csv"
+TRACT_SHP_PATH = BASE_DIR / "tl_2023_36_tract" / "tl_2023_36_tract.shp"
+
+CENSUS_API_KEY = "094639c98364a4419c71c18045f3c739f9284b2b"
+ACS_YEAR = "2023"
+ACS_DATASET = "acs/acs5"
+TABLE_POP = "B01003_001E"
+
+NYC_COUNTIES = {"005", "047", "061", "081", "085"}
+TARGET_EPSG = 2263
+
+# -----------------------------
+# 1) Load and clean restroom data
+# -----------------------------
+rest_df = pd.read_csv(RESTROOM_CSV_PATH)
+
+rest_df.columns = (
+    rest_df.columns
+    .str.strip()
+    .str.lower()
+    .str.replace(r"\s+", "_", regex=True)
+)
+
+lat_col = "latitude"
+lon_col = "longitude"
+
+rest_gdf = gpd.GeoDataFrame(
+    rest_df,
+    geometry=gpd.points_from_xy(rest_df[lon_col], rest_df[lat_col]),
+    crs="EPSG:4326"
+)
+
+# -----------------------------
+# 2) Load tract geometries
+# -----------------------------
+tracts = gpd.read_file(TRACT_SHP_PATH)
+tracts = tracts[
+    (tracts["STATEFP"] == "36") &
+    (tracts["COUNTYFP"].isin(NYC_COUNTIES))
+].copy()
+
+tracts["GEOID"] = tracts["STATEFP"] + tracts["COUNTYFP"] + tracts["TRACTCE"]
+
+if "NAMELSAD" in tracts.columns:
+    name_col = "NAMELSAD"
+elif "NAMELSAD20" in tracts.columns:
+    name_col = "NAMELSAD20"
+else:
+    name_col = "NAME"
+
+tracts["tract_name"] = tracts[name_col]
+
+borough_map = {
+    "005": "Bronx",
+    "047": "Brooklyn",
+    "061": "Manhattan",
+    "081": "Queens",
+    "085": "Staten Island"
+}
+tracts["borough"] = tracts["COUNTYFP"].map(borough_map)
+
+# -----------------------------
+# 3) Retrieve ACS population
+# -----------------------------
+base_url = f"https://api.census.gov/data/{ACS_YEAR}/{ACS_DATASET}"
+
+params = {
+    "get": f"{TABLE_POP},NAME",
+    "for": "tract:*",
+    "in": "state:36",
+    "key": CENSUS_API_KEY
+}
+
+resp = requests.get(base_url, params=params, timeout=60)
+resp.raise_for_status()
+data = resp.json()
+
+cols = data[0]
+rows = data[1:]
+pop_df = pd.DataFrame(rows, columns=cols)
+
+pop_df[TABLE_POP] = (
+    pd.to_numeric(pop_df[TABLE_POP], errors="coerce")
+    .fillna(0)
+    .astype(int)
+)
+
+pop_df["GEOID"] = pop_df["state"] + pop_df["county"] + pop_df["tract"]
+pop_df = pop_df[pop_df["county"].isin(NYC_COUNTIES)].copy()
+pop_df.rename(columns={TABLE_POP: "population"}, inplace=True)
+pop_df = pop_df[["GEOID", "population"]].copy()
+
+# Merge population into tract GeoDataFrame
+tracts = tracts.merge(pop_df, on="GEOID", how="left")
+tracts["population"] = tracts["population"].fillna(0).astype(int)
+
+# -----------------------------
+# 4) Reproject for distance/area calculations
+# -----------------------------
+tracts = tracts.to_crs(TARGET_EPSG)
+rest_gdf = rest_gdf.to_crs(TARGET_EPSG)
+```
+
+## Indicator Construction
+
+### Population Density
+
+In EPSG:2263, tract area is computed in square feet and converted to square kilometres:
+
+$$
+\text{area}_{km^2} = \text{area}_{ft^2} \times \frac{0.09290304}{1{,}000{,}000}
+$$
+
+Population density is then defined as:
+
+$$
+\text{pop\_density} =
+\frac{\text{population}}{\text{area}_{km^2}}
+$$
+
+
+```{python}
+#| label: area-and-density
+#| code-fold: true
+#| echo: true
+
+SQFT_TO_SQKM = 0.09290304 / 1_000_000
+
+tracts["area_km2"] = tracts.geometry.area * SQFT_TO_SQKM
+tracts["pop_density"] = (
+    tracts["population"] /
+    tracts["area_km2"].replace(0, np.nan)
+)
+```
+
+### Nearest Restroom Distance
+
+For each tract, the centroid is computed and the distance to the nearest public restroom is obtained via a nearest-neighbour spatial join:
+
+$$
+\text{nearest\_restroom\_dist}(i)
+= \min_j d(\text{centroid}_i, \text{restroom}_j)
+$$
+
+
+```{python}
+#| label: nearest-distance
+#| code-fold: true
+#| echo: true
+
+tracts["centroid"] = tracts.geometry.centroid
+
+centroids_gdf = gpd.GeoDataFrame(
+    tracts[["GEOID"]].copy(),
+    geometry=tracts["centroid"],
+    crs=tracts.crs
+)
+
+nearest = gpd.sjoin_nearest(
+    centroids_gdf,
+    rest_gdf,
+    how="left",
+    distance_col="nearest_restroom_dist"
+)[["GEOID", "nearest_restroom_dist"]]
+
+tracts = tracts.merge(nearest, on="GEOID", how="left")
+```
+
+### Restroom Count Within Each Tract
+
+The number of public restrooms located inside each census tract is computed by spatially joining restroom points to tract polygons:
+
+$$
+\text{restroom\_count}(i)
+= \sum_j \mathbf{1}(\text{restroom}_j \in \text{tract}_i)
+$$
+
+
+```{python}
+#| label: restroom-count
+#| code-fold: true
+#| echo: true
+
+rest_with_tract = gpd.sjoin(
+    rest_gdf,
+    tracts[["GEOID", "geometry"]],
+    how="left",
+    predicate="within"
+)
+
+rest_count = (
+    rest_with_tract
+    .groupby("GEOID")
+    .size()
+    .reset_index(name="restroom_count")
+)
+
+tracts = tracts.merge(rest_count, on="GEOID", how="left")
+tracts["restroom_count"] = tracts["restroom_count"].fillna(0).astype(int)
+```
+
+### People per Restroom
+
+To capture the degree of restroom shortage, a “people per restroom” indicator is defined as:
+
+$$
+\text{people\_per\_restroom} =
+\frac{\text{population}}{\text{restroom\_count} + 1}
+$$
+
+The \(+1\) adjustment ensures that tracts with zero restrooms still have a finite value.
+
+
+```{python}
+#| label: people-per-restroom
+#| code-fold: true
+#| echo: true
+
+tracts["people_per_restroom"] = (
+    tracts["population"] /
+    (tracts["restroom_count"] + 1)
+)
+```
+
+### Priority Score
+
+#### Log Transformation
+
+All indicators exhibit strong right-skewness, so log-transformations are applied to stabilize variance and align indicator directions:
+
+$$
+\begin{aligned}
+\text{log\_pop\_density} &= \log(1 + \text{pop\_density}) \\
+\text{log\_nearest\_dist} &= \log(1 + \text{nearest\_restroom\_dist}) \\
+\text{log\_people\_per\_restroom} &= \log(1 + \text{people\_per\_restroom})
+\end{aligned}
+$$
+
+
+```{python}
+#| label: log-transform
+#| code-fold: true
+#| echo: true
+
+tracts["log_people_per_restroom"] = np.log1p(tracts["people_per_restroom"])
+tracts["log_pop_density"] = np.log1p(tracts["pop_density"])
+tracts["log_nearest_dist"] = np.log1p(tracts["nearest_restroom_dist"])
+```
+
+### Standardization and Final Priority Score
+
+Each log-transformed indicator is standardized using a z-score:
+
+$$
+z_i = \frac{x_i - \mu_i}{\sigma_i}
+$$
+
+The **Priority Score** is defined as the mean of the three standardized indicators:
+
+$$
+\text{Priority\_Score} =
+\frac{
+z_{\text{pop\_density}} +
+z_{\text{nearest\_dist}} +
+z_{\text{people\_per\_restroom}}
+}{3}
+$$
+
+
+```{python}
+#| label: priority-score
+#| code-fold: true
+#| echo: true
+
+for col in ["log_pop_density", "log_nearest_dist", "log_people_per_restroom"]:
+    tracts[col + "_z"] = (
+        (tracts[col] - tracts[col].mean()) /
+        tracts[col].std()
+    )
+
+tracts["Priority_Score"] = (
+    tracts["log_pop_density_z"] +
+    tracts["log_nearest_dist_z"] +
+    tracts["log_people_per_restroom_z"]
+) / 3
+
+threshold = tracts["Priority_Score"].quantile(0.8)
+tracts["Priority_Class"] = (
+    tracts["Priority_Score"] >= threshold
+).astype(int)
+```
+
+### Export
+
+::: {.callout-note icon="📦" title="Exporting the Priority Score Table"}
+
+The final dataset including all computed indicators such as population density, nearest restroom distance, restroom count, people-per-restroom, and the Priority Score is exported as a CSV file for mapping and further analysis.
+
+
+**`NYC_Public_Restroom_Priority_Score.csv`**
+
+
+```{python}
+#| label: export-priority
+#| code-fold: true
+#| echo: true
+
+out_cols = [
+    "GEOID", "borough", "tract_name",
+    "population", "area_km2", "pop_density",
+    "restroom_count", "people_per_restroom",
+    "nearest_restroom_dist",
+    "Priority_Score", "Priority_Class"
+]
+
+tracts[out_cols].to_csv(
+    BASE_DIR / "NYC_Public_Restroom_Priority_Score.csv",
+    index=False
+)
+```
+:::
+
+## Spatial Visualization of Priority Scores
+
+While the Priority Score provides a numerical measure of restroom insufficiency,  
+it is equally important to understand how these high-priority areas are spatially distributed across New York City.  
+To accomplish this, a continuous color-mapped choropleth is generated at the census tract level.
+
+Darker colors correspond to tracts with higher Priority Scores—areas characterized by:
+
+- **high population density**
+- **greater distance to the nearest public restroom**
+- **a significant shortage of restroom facilities relative to population**
+
+
+```{python}
+#| label: priority-map
+#| fig-cap: "Spatial distribution of Priority Scores across NYC census tracts"
+#| code-fold: true
+#| echo: true
+
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+
+fig, ax = plt.subplots(figsize=(12, 12))
+
+cmap = mpl.cm.YlOrBr
+
+tracts.plot(
+    column="Priority_Score",
+    cmap=cmap,
+    linewidth=0,
+    edgecolor="none",
+    alpha=0.9,
+    legend=True,
+    legend_kwds={
+        "label": "Restroom Installation Priority",
+        "shrink": 0.6,
+        "orientation": "vertical"
+    },
+    ax=ax
+)
+
+ax.set_facecolor("#f7f7f7")
+
+ax.set_title(
+    "NYC Public Restroom Installation Priority Map",
+    fontsize=18, fontweight="bold",
+    pad=20
+)
+
+ax.set_axis_off()
+plt.tight_layout()
+plt.show()
+```
+
+## Extracting High-Priority Tracts
+
+Tracts in the top 20% of the Priority Score distribution are classified as  
+`Priority_Class = 1`, representing areas with the most severe restroom accessibility issues.
+
+The following code filters these high-priority tracts and displays the first few rows
+(sorted in descending order of the Priority Score).  
+This filtered table serves as the basis for subsequent spatial optimization (p-median)
+used to identify optimal locations for new public restroom installations.
+
+```{python}
+#| label: top-priority-table
+#| code-fold: true
+#| echo: true
+
+import pandas as pd
+
+# Load the exported priority score table
+df = pd.read_csv("NYC_Public_Restroom_Priority_Score.csv")
+
+# Filter high-priority tracts (Priority_Class == 1)
+top_priority = (
+    df[df["Priority_Class"] == 1]
+    .sort_values("Priority_Score", ascending=False)
+)
+
+# Display the top rows
+top_priority.head()
+```
+
+## Exploratory Data Analysis (EDA)
+
+To better understand restroom accessibility across New York City, several exploratory analyses are conducted on the derived indicators, including basic descriptive statistics, distributional patterns, spatial outliers, and comparisons between the most critical tracts and the city-wide average.
+
+
+### Summary Statistics
+
+The following numeric indicators are examined:
+
+- `population`
+- `area_km2`
+- `pop_density`
+- `restroom_count`
+- `people_per_restroom`
+- `nearest_restroom_dist`
+- `Priority_Score`
+- `Priority_Class`
+
+```{python}
+#| label: eda-describe
+#| fig-cap: "Summary statistics for population, spatial, and restroom-related indicators."
+#| echo: true
+
+num_cols = [
+    "population",
+    "area_km2",
+    "pop_density",
+    "restroom_count",
+    "people_per_restroom",
+    "nearest_restroom_dist",
+    "Priority_Score",
+    "Priority_Class",
+]
+
+tracts[num_cols].describe()
+```
+
+### Distribution of Key Indicators
+
+Many indicators exhibit strong right-skewness — especially population density,  
+distance to the nearest restroom, and people-per-restroom.  
+The histograms below show the distribution of these key metrics.
+
+```{python}
+#| label: eda-histograms
+#| code-fold: true
+#| fig-cap: "Histograms of population, density, restroom access, and shortage indicators."
+#| fig-width: 11
+#| fig-height: 3.5
+#| echo: true
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+sns.set_theme(style="whitegrid", context="notebook")
+plt.rcParams.update({
+    "figure.facecolor": "#edf0f5",
+    "axes.facecolor": "#edf0f5",
+    "grid.color": "white",
+    "grid.linewidth": 1.2,
+    "axes.edgecolor": "#d8d8d8",
+    "axes.linewidth": 1.0,
+})
+
+vars_hist = [
+    "population",
+    "pop_density",
+    "restroom_count",
+    "people_per_restroom",
+    "nearest_restroom_dist",
+]
+
+titles_hist = [
+    "Population per Tract",
+    "Population Density",
+    "Restroom Count per Tract",
+    "People per Restroom",
+    "Distance to Nearest Restroom (ft)",
+]
+
+fig, axes = plt.subplots(
+    1, len(vars_hist),
+    figsize=(18, 3.5),
+    sharey=False
+)
+
+for ax, col, title in zip(axes, vars_hist, titles_hist):
+    ax.hist(
+        tracts[col].dropna(),
+        bins=30,
+        color="#6eb5ff",
+        edgecolor="white"
+    )
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel("", fontsize=9)
+    ax.set_ylabel("Frequency", fontsize=9)
+
+plt.tight_layout()
+plt.show()
+```
+
+### Boxplots of Key Indicators
+
+Boxplots highlight extreme values—especially **restroom_count**,  
+where a very small number of tracts contain disproportionately many public restrooms.
+
+```{python}
+#| label: eda-boxplots
+#| code-fold: true
+#| fig-cap: "Boxplots showing distribution and extreme values of key restroom accessibility indicators."
+#| fig-width: 11
+#| fig-height: 3.5
+#| echo: true
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+sns.set_theme(style="whitegrid", context="notebook")
+plt.rcParams.update({
+    "figure.facecolor": "#edf0f5",
+    "axes.facecolor": "#edf0f5",
+    "grid.color": "white",
+    "grid.linewidth": 1.2,
+    "axes.edgecolor": "#d8d8d8",
+    "axes.linewidth": 1.0,
+})
+
+vars_box = [
+    "population",
+    "pop_density",
+    "restroom_count",
+    "people_per_restroom",
+    "nearest_restroom_dist",
+]
+
+titles_box = [
+    "Population per Tract",
+    "Population Density",
+    "Restroom Count per Tract",
+    "People per Restroom",
+    "Distance to Nearest Restroom (ft)",
+]
+
+fig, axes = plt.subplots(
+    1, len(vars_box),
+    figsize=(18, 3.5),
+    sharey=False
+)
+
+for ax, col, title in zip(axes, vars_box, titles_box):
+    sns.boxplot(
+        y=tracts[col].dropna(),
+        ax=ax,
+        color="#6eb5ff",
+        width=0.5
+    )
+    ax.set_title(title, fontsize=11)
+    ax.set_ylabel("", fontsize=9)
+
+plt.tight_layout()
+plt.show()
+```
+
+### Identifying Restroom Count Outliers
+
+A small number of census tracts contain **disproportionately many public restrooms**.  
+Most notably, one tract in **Manhattan contains 42 restrooms**, making it a clear spatial outlier.
+
+```{python}
+#| label: eda-outlier-restrooms
+#| code-fold: true
+#| fig-cap: "Census tracts with unusually high restroom counts (e.g., 20+ restrooms)."
+#| echo: true
+
+# Identify restroom-count outliers
+outliers = tracts[tracts["restroom_count"] > 20].copy()
+
+print("Census Tracts with Unusually High Restroom Counts (>20):")
+display(outliers[[
+    "GEOID",
+    "borough",
+    "tract_name",
+    "restroom_count"
+]].drop_duplicates())
+```
+
+### Spatial Visualization of Tracts
+
+To better understand how restroom availability varies spatially across New York City,  
+an interactive map is generated using **GeoPandas `.explore()` + Folium**.  
+This map visualizes three layers:
+
+- **All census tracts** (gray)  
+- **Restroom-count outlier tracts** (blue; e.g., 42 restrooms in one tract)  
+- **Top 5 highest-priority tracts** (red), based on the Priority Score  
+
+Each polygon includes a tooltip showing key demographic and restroom-related indicators.
+
+```{python}
+#| label: eda-spatial-map
+#| code-fold: true
+#| fig-cap: "Interactive map of all NYC tracts, restroom-count outliers, and the top 5 priority tracts."
+#| echo: true
+
+import geopandas as gpd
+import folium
+
+# -----------------------------------------
+# 1. Identify outlier tract(s)
+# -----------------------------------------
+outliers = tracts[tracts["restroom_count"] >= 42].copy()
+
+# -----------------------------------------
+# 2. Select top 5 highest-priority tracts
+# -----------------------------------------
+top5 = (
+    tracts[tracts["Priority_Class"] == 1]
+    .sort_values("Priority_Score", ascending=False)
+    .head(5)
+    .copy()
+)
+
+# Tooltip fields (same for all layers)
+tooltip_cols = [
+    "GEOID", "tract_name", "borough",
+    "population", "area_km2", "pop_density",
+    "nearest_restroom_dist", "restroom_count",
+    "people_per_restroom",
+    "log_pop_density", "log_nearest_dist", "log_people_per_restroom",
+    "Priority_Score", "Priority_Class",
+]
+
+# -----------------------------------------
+# 3. Base map (all census tracts)
+# -----------------------------------------
+m = tracts.explore(
+    color="#555555",
+    style_kwds={
+        "fillColor": "#B0B0B0",
+        "fillOpacity": 0.5,
+        "weight": 0.6,
+    },
+    tooltip=tooltip_cols,
+    name="All census tracts",
+)
+
+# -----------------------------------------
+# 4. Add restroom-count outliers (blue)
+# -----------------------------------------
+outliers.explore(
+    m=m,
+    color="#1f77b4",
+    style_kwds={
+        "fillColor": "#1f77b4",
+        "fillOpacity": 0.9,
+        "weight": 2.0,
+    },
+    tooltip=tooltip_cols,
+    name="Restroom count outliers (42+)",
+)
+
+# -----------------------------------------
+# 5. Add top 5 high-priority tracts (red)
+# -----------------------------------------
+top5.explore(
+    m=m,
+    color="#d62728",
+    style_kwds={
+        "fillColor": "#d62728",
+        "fillOpacity": 0.9,
+        "weight": 2.0,
+    },
+    tooltip=tooltip_cols,
+    name="Top 5 priority tracts",
+)
+
+folium.LayerControl().add_to(m)
+m
+```
+
+
+
+
+```{python}
+#| label: eda-top5-compare
+#| code-fold: true
+#| fig-cap: "Comparison of average values between NYC overall and the Top 5 priority tracts."
+#| echo: true
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Select the Top 5 tracts by Priority Score
+top5 = tracts.sort_values("Priority_Score", ascending=False).head(5).copy()
+
+# Metrics included in comparison
+metrics = [
+    "population",
+    "pop_density",
+    "nearest_restroom_dist",
+    "restroom_count",
+    "people_per_restroom",
+]
+
+# Compute NYC-wide means and Top 5 means
+overall_mean = tracts[metrics].mean()
+top5_mean = top5[metrics].mean()
+
+compare_df = pd.DataFrame({
+    "overall_mean": overall_mean,
+    "top5_mean": top5_mean,
+})
+compare_df["ratio_top5_to_overall"] = (
+    compare_df["top5_mean"] / compare_df["overall_mean"]
+)
+
+print("=== Top 5 Priority Tracts vs Overall NYC Average ===")
+display(compare_df)
+
+# ------------------------------
+# Visualization (Bar Chart)
+# ------------------------------
+fig, ax = plt.subplots(figsize=(8, 5))
+
+x = np.arange(len(metrics))
+width = 0.35
+
+overall_color = "#A0A0A0"
+top5_color = "#C5A8FF"
+
+ax.bar(
+    x - width/2, overall_mean, width,
+    label="NYC Average", color=overall_color
+)
+ax.bar(
+    x + width/2, top5_mean, width,
+    label="Top 5 Priority Tracts", color=top5_color
+)
+
+ax.set_xticks(x)
+ax.set_xticklabels(metrics, rotation=20)
+ax.set_ylabel("Value")
+ax.set_title("Top 5 Priority Tracts vs Overall NYC Average")
+
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+
+## Comparing Top 5 Priority Tracts to Citywide Averages
+
+The comparison between the top 5 priority tracts and NYC-wide averages shows a consistent pattern of disadvantage in the selected tracts:
+
+- **Higher population and population density**  
+  On average, the top 5 tracts have **larger populations and higher population densities** than the NYC average.  
+  This means that many people are concentrated into relatively small areas where restroom infrastructure is limited.
+
+- **Greater distance to the nearest restroom**  
+  The mean `nearest_restroom_dist` is substantially higher for the top 5 tracts.  
+  Residents in these areas must travel **much farther** to reach the closest public restroom, reinforcing the notion of accessibility gaps.
+
+- **Limited restroom supply despite high demand**  
+  The average `restroom_count` in the top 5 tracts is **not particularly high**, and in some cases remains very low, even though population pressure is strong.  
+  This contrasts sharply with the outlier tract in Manhattan, where many restrooms are concentrated in a small area.
+
+- **Severe people-per-restroom ratios**  
+  The people-per-restroom indicator is considerably higher for the top 5 tracts than for NYC overall.  
+  This confirms that **each restroom must serve many more people** in these tracts than in the typical NYC census tract.
+
+Taken together, these patterns justify the selection of the top 5 tracts as **priority candidates for new restroom installations**, both from a demand perspective (population and density) and from a supply perspective (distance and shortage).
+
+
+
+
+## Interpretation of EDA Findings
+
+The exploratory analysis highlights several important patterns in how public restroom access is distributed across New York City:
+
+- **Strong right-skewness in key indicators**  
+  Population, population density, distance to the nearest restroom, and the people-per-restroom indicator all show long right tails.  
+  This implies that while many tracts have moderate conditions, a non-trivial subset experiences **extreme crowding or very poor access**.
+
+- **Most tracts have few or no public restrooms**  
+  The distribution of `restroom_count` is heavily concentrated near 0–2 restrooms per tract.  
+  Combined with high population density in many of these areas, this suggests that **the majority of census tracts rely on very limited restroom infrastructure**.
+
+- **People-per-restroom as a shortage indicator**  
+  The people-per-restroom metric makes visible the imbalance between population and facility supply.  
+  Tracts with high values on this indicator represent areas where **each restroom effectively serves a disproportionately large number of residents**.
+
+- **Spatial concentration of extreme outliers**  
+  One census tract in Manhattan (Census Tract 143) contains 42 restrooms, making it a clear outlier relative to the rest of the city.  
+  This suggests that **certain high-traffic or tourist-oriented areas accumulate a dense cluster of facilities**, while many residential tracts remain underserved.
+
+- **Clear spatial structure in Priority Scores**  
+  The choropleth map of the Priority Score reveals that high-priority tracts are not randomly scattered but form **spatial clusters** in parts of the city where:
+  - population density is high,
+  - the nearest restroom is relatively far,
+  - and restroom counts are very low.
+
+These patterns provide the motivation for focusing on the **top 5 priority tracts** and examining their conditions in more detail.
+
+
+### Comparison: Top 5 Priority Tracts vs NYC Overall
+
+To better understand how severe restroom shortages are within the highest-priority areas,  
+the average values of key indicators in the **Top 5 tracts** are compared with the **NYC-wide averages**.
+
+The metrics examined are:
+
+- population  
+- population density  
+- distance to nearest restroom  
+- restroom count  
+- people per restroom (shortage indicator)  
+
+A bar chart visualizes how the Top 5 differ significantly from the city as a whole.
+
+
+## Correlation Analysis
+
+To evaluate whether public restroom placement across New York City aligns with demographic needs and accessibility expectations, correlation analysis is conducted between key indicators such as population density, restroom count, and distance to the nearest restroom.
+
+### Theoretically Expected Relationships
+
+If public restrooms were efficiently allocated based on population needs, we would expect:
+
+1. **Population Density ↔ Restroom Count (Positive)**
+   - Densely populated tracts should require more restrooms.
+   - A **strong positive correlation (+)** would be expected in a well-planned system.
+
+2. **Restroom Count ↔ Nearest Restroom Distance (Negative)**
+   - More restrooms in an area should reduce the average distance to the nearest one.
+   - A **strong negative correlation (–)** would be expected.
+
+---
+
+### Empirical Results from NYC Data
+
+#### 1. Population Density vs Restroom Count
+
+- **Correlation ≈ –0.12** (very weak negative)
+- Indicates that **areas with more people do not have more restrooms**
+- This suggests that restroom supply is driven more by the presence of parks and specific public facilities than by residential population demand.
+
+```{python}
+#| label: corr-popdensity-restcount
+#| echo: true
+#| code-fold: true
+
+corr1 = tracts["pop_density"].corr(tracts["restroom_count"])
+print("Correlation: Population Density vs Restroom Count =", corr1)
+```
+
+In this dataset, the correlation is approximately –0.12, indicating a very weak (slightly negative) relationship.
+This suggests that tracts with more residents do not systematically receive more public restrooms.
+Instead, restroom provision appears to be influenced more by park locations, waterfront/recreational areas, and specific public facilities than by residential population density alone.
+
+The scatterplot below visualizes this weak relationship.
+
+
+```{python}
+#| label: corr-popdensity-restcount-plot
+#| code-fold: true
+#| echo: true
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+sns.regplot(x="pop_density", y="restroom_count", data=tracts,
+            scatter_kws={"alpha":0.4}, line_kws={"color":"red"})
+plt.title("Population Density vs Restroom Count")
+plt.show()
+```
+
+#### 2. Restroom Count vs Nearest Restroom Distance
+
+- **Correlation ≈ –0.16**  
+- Indicates that tracts with more restrooms do not necessarily enjoy significantly shorter distances to the nearest restroom.  
+- This suggests that even where restrooms exist, they may be clustered in small areas, failing to improve accessibility across the entire tract.
+
+```{python}
+#| label: corr-restcount-nearestdist
+#| echo: true
+#| code-fold: true
+
+corr2 = tracts["restroom_count"].corr(tracts["nearest_restroom_dist"])
+print("Correlation: Restroom Count vs Nearest Restroom Distance =", corr2)
+```
+
+The correlation is approximately –0.16, revealing only a very weak negative relationship.
+In a well-distributed restroom system, we would expect a strong negative correlation—
+more restrooms → shorter average distance.
+
+However, NYC’s pattern shows the opposite:
+restrooms tend to be concentrated in a few hotspots (parks, waterfronts, or tourist corridors),
+so much of the surrounding tract still remains far from the nearest restroom.
+
+The scatterplot below visualizes this weak relationship.
+
+```{python}
+sns.regplot(x="restroom_count", y="nearest_restroom_dist", data=tracts,
+            scatter_kws={"alpha":0.4}, line_kws={"color":"red"})
+plt.title("Restroom Count vs Nearest Restroom Distance")
+plt.show()
+```
+
+## Characterising the Top 5 Priority Tracts
+
+The Priority Score identifies census tracts where population density, distance to the nearest public restroom,  
+and people-per-restroom all indicate severe restroom scarcity.  
+In this section, the five tracts with the highest Priority Scores are examined in more detail,  
+focusing on nearby community facilities and spatial context.
+
+### Loading Facility Datasets and Top 5 Tracts
+
+The following code loads all required community facility datasets, converts them to a common projected CRS  
+(**EPSG:2263**, feet), and extracts the Top 5 priority tracts based on the previously exported  
+`NYC_Public_Restroom_Priority_Score.csv`.
+
+```{python}
+#| label: top5-load-facilities
+#| code-fold: true
+#| echo: true
+
+import pandas as pd
+import geopandas as gpd
+from shapely import wkt
+
+# -----------------------------------------------------------
+# Helper function to load point-based CSV datasets
+# -----------------------------------------------------------
+def load_point_csv(path, lat_col, lon_col, crs="EPSG:4326", dedup_col=None):
+    df = pd.read_csv(path)
+
+    # Optionally drop duplicates (e.g., multiple rows per stop)
+    if dedup_col is not None and dedup_col in df.columns:
+        df = df.drop_duplicates(subset=[dedup_col])
+
+    # Remove rows with missing coordinates
+    df = df.dropna(subset=[lat_col, lon_col])
+
+    # Create point geometries
+    gdf = gpd.GeoDataFrame(
+        df,
+        geometry=gpd.points_from_xy(df[lon_col], df[lat_col]),
+        crs=crs
+    )
+
+    # Convert to analysis CRS (NAD83 / New York Long Island - EPSG:2263)
+    return gdf.to_crs(2263)
+
+
+# -----------------------------------------------------------
+# 1. Load Required Facility Datasets
+# -----------------------------------------------------------
+
+# Subway Stations
+subway = load_point_csv(
+    "data/MTA_Subway_Stations.csv",
+    lat_col="GTFS Latitude",
+    lon_col="GTFS Longitude"
+)
+
+# NYCHA Facilities
+nycha = load_point_csv(
+    "data/NYCHA_Facilities_and_Service_Centers.csv",
+    lat_col="Latitude",
+    lon_col="Longitude"
+)
+
+# MTA Bus Stops (deduplicated by Stop ID)
+bus_stops = load_point_csv(
+    "data/MTA_Bus_Stops.csv",
+    lat_col="Latitude",
+    lon_col="Longitude",
+    dedup_col="Stop ID"
+)
+
+# Social Service Facilities (from FacDB)
+fac_all = pd.read_csv("data/Facilities_Database.csv")
+
+social_fac_groups = [
+    "ADULT SERVICES",
+    "HUMAN SERVICES",
+    "CHILD SERVICES AND WELFARE",
+    "YOUTH SERVICES",
+]
+
+social_df = fac_all[fac_all["facgroup"].isin(social_fac_groups)].copy()
+social_df = social_df.dropna(subset=["geometry"])
+social_df["geometry"] = social_df["geometry"].apply(wkt.loads)
+
+# FacDB geometry is already in EPSG:2263
+social_services = gpd.GeoDataFrame(
+    social_df,
+    geometry="geometry",
+    crs="EPSG:2263"
+)
+
+# -----------------------------------------------------------
+# 2. Load Schools (shapefile → points)
+# -----------------------------------------------------------
+schools = gpd.read_file("data/SchoolPoints_APS_2024_08_28/SchoolPoints_APS_2024_08_28.shp")
+schools = schools.to_crs(2263)
+
+# -----------------------------------------------------------
+# 3. Load Parks (WKT multipolygon → polygons)
+# -----------------------------------------------------------
+parks_df = pd.read_csv("data/Parks_Zones.csv")
+parks_df["geometry"] = parks_df["multipolygon"].apply(wkt.loads)
+
+parks = gpd.GeoDataFrame(parks_df, geometry="geometry", crs="EPSG:4326")
+parks = parks.to_crs(2263)
+
+# -----------------------------------------------------------
+# 4. Load Top 5 Priority Tracts (from priority score CSV)
+# -----------------------------------------------------------
+df = pd.read_csv("NYC_Public_Restroom_Priority_Score.csv", dtype={"GEOID": str})
+
+top5_ids = (
+    df[df["Priority_Class"] == 1]
+    .sort_values("Priority_Score", ascending=False)
+    .head(5)["GEOID"]
+    .tolist()
+)
+
+tracts = gpd.read_file("tl_2023_36_tract/tl_2023_36_tract.shp")
+
+NYC_COUNTIES = {"005", "047", "061", "081", "085"}
+tracts = tracts[
+    (tracts["STATEFP"] == "36") &
+    (tracts["COUNTYFP"].isin(NYC_COUNTIES))
+].copy()
+
+tracts = tracts.to_crs(2263)
+tracts["GEOID"] = tracts["GEOID"].astype(str)
+
+tracts_top5 = tracts[tracts["GEOID"].isin(top5_ids)].copy()
+
+tracts_top5 = tracts_top5.merge(
+    df[["GEOID", "Priority_Score"]],
+    on="GEOID",
+    how="left"
+).sort_values("Priority_Score", ascending=False)
+
+tracts_top5[["GEOID", "NAMELSAD", "Priority_Score"]]
+```
+
+### Identifying Facilities Within 1500 ft of the Top 5 Priority Tracts
+
+To understand the service environment surrounding each high-priority tract,  
+the following code identifies all community facility types located within **1500 ft** of the Top 5 tracts.
+
+This includes:
+
+- **Bus stops**  
+- **Subway stations**  
+- **Schools**  
+- **Parks** (polygon → centroid)  
+- **NYCHA facilities**  
+- **Social service facilities**
+
+A 1500-ft buffer is created around each Top 5 tract, and spatial joins are performed to extract nearby facilities.
+
+```{python}
+#| label: near-facilities-top5
+#| code-fold: true
+#| echo: true
+
+import numpy as np
+
+# -----------------------------------------------------------
+# 1) Prepare geometry for the top 5 tracts
+# -----------------------------------------------------------
+top5_geom = tracts_top5[["GEOID", "geometry"]].copy()
+
+
+# -----------------------------------------------------------
+# 2) Helper: find point features near top 5 tracts
+# -----------------------------------------------------------
+def points_near_top5(points_gdf, label, buffer_ft=1500):
+
+    if points_gdf.empty:
+        print(f"{label}: input GeoDataFrame is empty.")
+        return points_gdf.iloc[0:0].copy()
+
+    # Buffer the tract geometries
+    buffered = top5_geom.copy()
+    buffered["geometry"] = buffered.geometry.buffer(buffer_ft)
+
+    # Spatial join (points intersecting buffered tract polygons)
+    joined = gpd.sjoin(points_gdf, buffered, how="inner", predicate="intersects")
+
+    print(f"{label} within ~{buffer_ft} ft of top 5 tracts:", len(joined))
+    return joined
+
+
+# -----------------------------------------------------------
+# 3) Helper: find park polygons near top 5 tracts
+# -----------------------------------------------------------
+def parks_near_top5(parks_gdf, label="Parks (polygons)", buffer_ft=1500):
+
+    if parks_gdf.empty:
+        print(f"{label}: input GeoDataFrame is empty.")
+        return parks_gdf.iloc[0:0].copy()
+
+    # Buffer the tract geometries
+    buffered = top5_geom.copy()
+    buffered["geometry"] = buffered.geometry.buffer(buffer_ft)
+
+    # Spatial join (polygon intersects buffer)
+    joined = gpd.sjoin(parks_gdf, buffered, how="inner", predicate="intersects")
+
+    print(f"{label} within ~{buffer_ft} ft of top 5 tracts:", len(joined))
+    return joined
+
+
+# -----------------------------------------------------------
+# 4) Compute nearby facilities for each dataset
+# -----------------------------------------------------------
+bus_near      = points_near_top5(bus_stops,       "Bus stops")
+subway_near   = points_near_top5(subway,          "Subway stations")
+social_near   = points_near_top5(social_services, "Social service facilities")
+nycha_near    = points_near_top5(nycha,           "NYCHA facilities")
+schools_near  = points_near_top5(schools,         "Schools")
+parks_near    = parks_near_top5(parks,            "Parks (polygons)")
+```
+
+
+
+
+### Computing Optimal Restroom Locations Using the p-Median Model
+
+To identify the most effective restroom placement **within each of the Top 5 priority tracts**,  
+a **p-median (p = 1)** optimization is applied. This model selects the single location inside each tract  
+that minimizes the weighted distance to nearby high-demand facilities.
+
+---
+
+### Rationale for Weighted Demand (Sanitation Equity Framework)
+
+Different facility types are assigned different weights based on principles widely cited in  
+urban planning, public health, homelessness services planning, and sanitation equity literature.
+
+Multiple official reports and peer-reviewed studies  
+(NYC Department of Health and Mental Hygiene, 2019;  
+NYC Independent Budget Office, 2023;  
+UN-Habitat, 2020;  
+NYC Department of Homeless Services, 2021;  
+Grier & Perry, 2018)  
+highlight that **restroom scarcity is most severe in areas with high concentrations of vulnerable populations**,  
+including unhoused individuals, low-income residents, and residents of public housing.
+
+Key findings from these sources emphasize:
+
+- **Social service facilities, shelters, and public housing (NYCHA)** are located in communities with  
+  the greatest structural sanitation barriers and are consistently classified as  
+  **high-priority “sanitation desert” zones**.
+
+- **Schools** generate high daytime foot traffic and youth pedestrian activity—groups shown to have  
+  increased restroom needs (U.S. Environmental Protection Agency, 2020).
+
+- **Subway stations** often contain indoor restrooms (many closed, but built) and therefore exert lower  
+  *external* restroom demand compared to social-service environments  
+  (NYC Independent Budget Office, 2023).
+
+- **Parks, bus stops, and general public facilities** contribute meaningfully to restroom need  
+  but generally serve more mixed populations and therefore receive lower weights.
+
+Based on these empirical findings, the model assigns **higher weights to facilities that directly serve  
+vulnerable or high-restroom-need populations**, and lower weights to more general-use or  
+transport-centered facilities.
+
+---
+
+### Facility Weights Used in the Optimization
+
+- **Social service facilities** – **3.5**  
+- **Schools** – **3.0**  
+- **NYCHA residential facilities** – **2.5**  
+- **Subway stations** – **2.0**  
+- **Parks** – **1.5**  
+- **Bus stops** – **1.0**
+
+These weights operationalize a sanitation-equity perspective:  
+**locations that serve vulnerable or high-need populations exert stronger influence  
+on optimal restroom placement.**
+
+---
+
+### Optimization Steps
+
+1. **Gather all nearby demand points** within ~1500 ft of each tract  
+2. **Generate grid candidate points** (200-ft spacing inside tract boundaries)  
+3. **Compute weighted p-median costs**  
+4. **Select the location minimizing total weighted walking distance**  
+5. **Output the optimal restroom site (lat/lon)**
+
+
+
+```{python}
+from shapely.geometry import Point
+
+# -----------------------------------------------------------
+# 0) Facility weights (modifiable)
+# -----------------------------------------------------------
+FACILITY_WEIGHTS = {
+    "subway": 2.0,
+    "bus": 1.0,
+    "schools": 3.0,
+    "parks": 1.5,
+    "nycha": 2.5,
+    "social": 3.5
+}
+
+
+# -----------------------------------------------------------
+# 1) Collect facility (demand) points for one tract
+# -----------------------------------------------------------
+def get_facility_points_for_tract(geoid):
+
+    dfs = []
+
+    # Subway
+    if 'subway_near' in globals() and not subway_near.empty:
+        sub = subway_near[subway_near["GEOID"] == geoid].copy()
+        if not sub.empty:
+            sub["weight"] = FACILITY_WEIGHTS["subway"]
+            dfs.append(sub[["geometry", "weight"]])
+
+    # Bus stops
+    if 'bus_near' in globals() and not bus_near.empty:
+        bs = bus_near[bus_near["GEOID"] == geoid].copy()
+        if not bs.empty:
+            bs["weight"] = FACILITY_WEIGHTS["bus"]
+            dfs.append(bs[["geometry", "weight"]])
+
+    # Schools
+    if 'schools_near' in globals() and not schools_near.empty:
+        sch = schools_near[schools_near["GEOID"] == geoid].copy()
+        if not sch.empty:
+            sch["weight"] = FACILITY_WEIGHTS["schools"]
+            dfs.append(sch[["geometry", "weight"]])
+
+    # Parks (polygons → centroids)
+    if 'parks_near' in globals() and not parks_near.empty:
+        pk = parks_near[parks_near["GEOID"] == geoid].copy()
+        if not pk.empty:
+            pk["geometry"] = pk.geometry.centroid
+            pk["weight"] = FACILITY_WEIGHTS["parks"]
+            dfs.append(pk[["geometry", "weight"]])
+
+    # NYCHA
+    if 'nycha_near' in globals() and not nycha_near.empty:
+        ny = nycha_near[nycha_near["GEOID"] == geoid].copy()
+        if not ny.empty:
+            ny["weight"] = FACILITY_WEIGHTS["nycha"]
+            dfs.append(ny[["geometry", "weight"]])
+
+    # Social service facilities
+    if 'social_near' in globals() and not social_near.empty:
+        ss = social_near[social_near["GEOID"] == geoid].copy()
+        if not ss.empty:
+            ss["weight"] = FACILITY_WEIGHTS["social"]
+            dfs.append(ss[["geometry", "weight"]])
+
+    # No facilities found
+    if len(dfs) == 0:
+        return gpd.GeoDataFrame(
+            columns=["geometry", "weight"], geometry="geometry", crs=tracts_top5.crs
+        )
+
+    facilities = gpd.GeoDataFrame(
+        pd.concat(dfs, ignore_index=True),
+        geometry="geometry",
+        crs=tracts_top5.crs
+    )
+    return facilities
+
+
+# -----------------------------------------------------------
+# 2) Generate grid candidate points (every 200 ft)
+# -----------------------------------------------------------
+def generate_grid_candidates_for_tract(geoid, cell_size_ft=200):
+
+    tract_row = tracts_top5[tracts_top5["GEOID"] == geoid]
+    if tract_row.empty:
+        raise ValueError(f"GEOID {geoid} not found in tracts_top5")
+
+    geom = tract_row.geometry.iloc[0]
+    minx, miny, maxx, maxy = geom.bounds
+
+    xs = np.arange(minx, maxx, cell_size_ft)
+    ys = np.arange(miny, maxy, cell_size_ft)
+
+    points = []
+    for x in xs:
+        for y in ys:
+            pt = Point(x, y)
+            if geom.contains(pt):  # keep only points inside the tract
+                points.append(pt)
+
+    # Fallback: tract centroid
+    if not points:
+        points = [geom.centroid]
+
+    return gpd.GeoDataFrame(geometry=points, crs=tracts_top5.crs)
+
+
+# -----------------------------------------------------------
+# 3) p-median (p = 1) using grid candidates
+# -----------------------------------------------------------
+def p_median_one_tract_grid(geoid, cell_size_ft=200):
+
+    facilities = get_facility_points_for_tract(geoid)
+
+    # No facilities → centroid solution
+    tract_row = tracts_top5[tracts_top5["GEOID"] == geoid].iloc[0]
+    geom = tract_row.geometry
+
+    if facilities.empty:
+        centroid = geom.centroid
+        return centroid, 0.0, facilities, gpd.GeoDataFrame(geometry=[centroid], crs=tracts_top5.crs)
+
+    candidates = generate_grid_candidates_for_tract(geoid, cell_size_ft=cell_size_ft)
+
+    demand_points = facilities.geometry.values
+    weights = facilities["weight"].values
+
+    best_cost = np.inf
+    best_point = None
+
+    for cand in candidates.geometry:
+        dists = np.array([cand.distance(pt) for pt in demand_points])
+        cost = np.sum(dists * weights)
+
+        if cost < best_cost:
+            best_cost = cost
+            best_point = cand
+
+    return best_point, best_cost, facilities, candidates
+
+
+# -----------------------------------------------------------
+# 4) Run p-median for all Top 5 tracts
+# -----------------------------------------------------------
+results = []
+
+for gid in tracts_top5["GEOID"]:
+    best_point, best_cost, _, _ = p_median_one_tract_grid(
+        geoid=gid, cell_size_ft=200
+    )
+    results.append({"GEOID": gid, "p_median_cost": best_cost, "geometry": best_point})
+
+candidate_sites = gpd.GeoDataFrame(results, geometry="geometry", crs=tracts_top5.crs)
+
+# Convert to WGS84
+candidate_sites_ll = candidate_sites.to_crs(4326).copy()
+candidate_sites_ll["lat"] = candidate_sites_ll.geometry.y
+candidate_sites_ll["lon"] = candidate_sites_ll.geometry.x
+
+
+# -----------------------------------------------------------
+# Merge tract info for reporting
+# -----------------------------------------------------------
+tract_info = tracts_top5.copy()
+
+borough_map = {
+    "005": "Bronx",
+    "047": "Brooklyn",
+    "061": "Manhattan",
+    "081": "Queens",
+    "085": "Staten Island",
+}
+tract_info["borough"] = tract_info["COUNTYFP"].map(borough_map)
+tract_info["tract_name"] = tract_info["NAMELSAD"]
+
+tract_info_small = tract_info[["GEOID", "borough", "tract_name", "Priority_Score"]]
+
+final_df = candidate_sites_ll.merge(tract_info_small, on="GEOID", how="left")
+
+final_df = final_df[
+    ["GEOID", "borough", "tract_name", "Priority_Score", "lat", "lon", "p_median_cost"]
+]
+final_df
+```
+
+
+### Visualizing Facility Context and Recommended Restroom Sites
+
+To better understand the **local context** around each Top 5 priority tract,  
+an interactive map is generated using **Folium**.  
+
+For each tract, the map displays:
+
+- The **tract boundary** (yellow fill with red outline)  
+- Nearby facilities within ~1500 ft:
+  - Subway stations (blue)
+  - Schools (red)
+  - Parks (green, using polygon centroids)
+  - NYCHA facilities (orange)
+  - Bus stops (purple)
+  - Social service facilities (black)
+- The **recommended restroom site** from the p-median model (black “X”)
+
+This visualization makes it possible to see whether the proposed restroom location is  
+integrated into the everyday activity space of residents and vulnerable users.
+
+```{python}
+#| label: folium-plot-top5
+#| code-fold: true
+#| echo: true
+
+import folium
+
+def plot_tract_facilities_folium(geoid, zoom_start=15):
+    # --- 1) Select tract and convert to WGS84 (EPSG:4326) ---
+    tract_2263 = tracts_top5[tracts_top5["GEOID"] == geoid]
+    tract = tract_2263.to_crs(4326)
+
+    # Center of the map
+    center_y = tract.geometry.iloc[0].centroid.y
+    center_x = tract.geometry.iloc[0].centroid.x
+
+    # --- 2) Select optimal site for this tract ---
+    site_2263 = candidate_sites[candidate_sites["GEOID"] == geoid]
+    site = site_2263.to_crs(4326)
+
+    # --- 3) Filter nearby facilities for this tract and convert CRS ---
+    def _sel_to_4326(gdf_near):
+        sub = gdf_near[gdf_near["GEOID"] == geoid].copy()
+        if sub.empty:
+            return sub  # empty GeoDataFrame
+        return sub.to_crs(4326)
+
+    subway_gdf   = _sel_to_4326(subway_near)
+    schools_gdf  = _sel_to_4326(schools_near)
+    parks_gdf    = _sel_to_4326(parks_near)
+    nycha_gdf    = _sel_to_4326(nycha_near)
+    bus_gdf      = _sel_to_4326(bus_near)
+    social_gdf   = _sel_to_4326(social_near)
+
+    # --- 4) Create folium map ---
+    m = folium.Map(location=[center_y, center_x], zoom_start=zoom_start)
+
+    # Tract boundary (yellow fill, red outline)
+    folium.GeoJson(
+        tract.geometry.iloc[0],
+        style_function=lambda x: {
+            "color": "red",
+            "weight": 2,
+            "fillColor": "yellow",
+            "fillOpacity": 0.3
+        }
+    ).add_to(m)
+
+    # --- 5) Add facilities as CircleMarkers ---
+
+    # Subway
+    for _, row in subway_gdf.iterrows():
+        folium.CircleMarker(
+            location=[row.geometry.y, row.geometry.x],
+            radius=4,
+            color="blue",
+            fill=True,
+            fill_opacity=1,
+            popup="Subway station"
+        ).add_to(m)
+
+    # Schools
+    for _, row in schools_gdf.iterrows():
+        folium.CircleMarker(
+            location=[row.geometry.y, row.geometry.x],
+            radius=4,
+            color="red",
+            fill=True,
+            fill_opacity=1,
+            popup="School"
+        ).add_to(m)
+
+    # Parks (polygon centroid)
+    for _, row in parks_gdf.iterrows():
+        folium.CircleMarker(
+            location=[row.geometry.centroid.y, row.geometry.centroid.x],
+            radius=4,
+            color="green",
+            fill=True,
+            fill_opacity=1,
+            popup="Park"
+        ).add_to(m)
+
+    # NYCHA
+    for _, row in nycha_gdf.iterrows():
+        folium.CircleMarker(
+            location=[row.geometry.y, row.geometry.x],
+            radius=4,
+            color="orange",
+            fill=True,
+            fill_opacity=1,
+            popup="NYCHA facility"
+        ).add_to(m)
+
+    # Bus stops 
+    for _, row in bus_gdf.iterrows():
+        folium.CircleMarker(
+            location=[row.geometry.y, row.geometry.x],
+            radius=2,
+            color="purple",
+            fill=True,
+            fill_opacity=0.7,
+            popup="Bus stop"
+        ).add_to(m)
+
+    # Social service facilities
+    for _, row in social_gdf.iterrows():
+        folium.CircleMarker(
+            location=[row.geometry.y, row.geometry.x],
+            radius=4,
+            color="black",
+            fill=True,
+            fill_opacity=1,
+            popup="Social service facility"
+        ).add_to(m)
+
+    # --- 6) Add optimal restroom site (big black X) ---
+    if not site.empty:
+        s = site.geometry.iloc[0]
+        folium.Marker(
+            location=[s.y, s.x],
+            icon=folium.Icon(color="black", icon="glyphicon-remove"),
+            popup=f"Recommended restroom site (GEOID {geoid})"
+        ).add_to(m)
+
+    # --- 7) Simple legend (HTML) ---
+    legend_html = """
+     <div style="position: fixed; 
+                 bottom: 30px; left: 30px; width: 210px; 
+                 background-color: white; z-index: 9999; 
+                 border:2px solid grey; border-radius:6px;
+                 padding: 8px; font-size: 12px;">
+     <b>Legend</b><br>
+     <span style="color: blue;">●</span> Subway<br>
+     <span style="color: red;">●</span> Schools<br>
+     <span style="color: green;">●</span> Parks<br>
+     <span style="color: orange;">●</span> NYCHA<br>
+     <span style="color: purple;">●</span> Bus stops<br>
+     <span style="color: black;">●</span> Social services<br>
+     <span style="color: black;">✖</span> Recommended restroom
+     </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    return m
+```
+
+```{python}
+for gid in tracts_top5["GEOID"]:
+    print("Plotting", gid)
+    m = plot_tract_facilities_folium(gid)
+    display(m)   
+```
+
+### Facility Composition within 1500 ft of Top 5 Priority Tracts
+
+To understand **what kinds of community facilities surround each Top 5 tract**,  
+the number of nearby facilities within **1500 ft** is aggregated by type:
+
+- Subway stations  
+- Bus stops  
+- Schools  
+- Parks  
+- NYCHA facilities  
+- Social service facilities  
+
+These facility counts are then reshaped into a table and visualized as a **stacked bar chart**,  
+showing how each tract differs in terms of surrounding demand-generating infrastructure.
+
+```{python}
+#| label: fac-counts-top5
+#| code-fold: true
+#| echo: true
+
+# Dictionary of all precomputed "nearby facility" GeoDataFrames
+facility_sources = {
+    "subway": subway_near,
+    "bus": bus_near,
+    "schools": schools_near,
+    "parks": parks_near,
+    "nycha": nycha_near,
+    "social": social_near,
+}
+
+rows = []
+top5_ids = tracts_top5["GEOID"].tolist()
+
+for ftype, gdf in facility_sources.items():
+    if gdf is None or gdf.empty:
+        continue
+
+    # Keep only facilities associated with the Top 5 GEOIDs
+    sub = gdf[gdf["GEOID"].isin(top5_ids)]
+    if sub.empty:
+        continue
+
+    # Count number of facilities by GEOID
+    counts = sub.groupby("GEOID").size()
+
+    for geoid, cnt in counts.items():
+        rows.append({"GEOID": geoid, "facility_type": ftype, "count": cnt})
+
+# Long-format table of facility counts
+fac_counts = pd.DataFrame(rows)
+```
+
+```{python}
+fac_pivot = (
+    fac_counts.pivot(
+        index="GEOID",
+        columns="facility_type",
+        values="count",
+    )
+    .fillna(0)
+    .astype(int)
+)
+```
+
+```{python}
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+sns.set_theme(style="whitegrid", context="notebook")
+plt.rcParams.update({
+    "figure.facecolor": "#edf0f5",
+    "axes.facecolor": "#edf0f5",
+    "grid.color": "white",
+    "grid.linewidth": 1.2,
+    "axes.edgecolor": "#d8d8d8",
+    "axes.linewidth": 1.0,
+})
+
+# ---------- Build labels ----------
+tract_labels = tracts_top5.copy()
+
+# If 'borough' column is missing, create it from COUNTYFP
+if "borough" not in tract_labels.columns:
+    borough_map = {
+        "005": "Bronx",
+        "047": "Brooklyn",
+        "061": "Manhattan",
+        "081": "Queens",
+        "085": "Staten Island",
+    }
+    tract_labels["borough"] = tract_labels["COUNTYFP"].map(borough_map)
+
+# If 'tract_name' is missing, create it
+if "tract_name" not in tract_labels.columns:
+    tract_labels["tract_name"] = tract_labels["NAMELSAD"]
+
+# Build "Borough - Tract Name"
+tract_labels["label"] = (
+    tract_labels["borough"] + " - " + tract_labels["tract_name"]
+)
+
+# Map GEOID → label
+label_map = dict(zip(tract_labels["GEOID"], tract_labels["label"]))
+
+fac_pivot_labeled = fac_pivot.copy()
+fac_pivot_labeled.index = fac_pivot_labeled.index.map(label_map)
+
+# -------------------------------------------------------------
+# Color Palette 
+# -------------------------------------------------------------
+palette = {
+    "bus":    "#74A9FF",  # skylight blue
+    "nycha":  "#F3C969",  # sandy yellow
+    "parks":  "#89C59C",  # soft mint green
+    "schools":"#E57CA7",  # rose pink
+    "social": "#C9B6FF",  # pastel lavender
+    "subway": "#B98B64",  # warm brown
+}
+
+colors = [palette[c] for c in fac_pivot_labeled.columns]
+
+# -------------------------------------------------------------
+# Plot stacked bar chart
+# -------------------------------------------------------------
+fig, ax = plt.subplots(figsize=(12, 6))
+
+fac_pivot_labeled.plot(
+    kind="bar",
+    stacked=True,
+    ax=ax,
+    color=colors,
+    edgecolor="white",
+    linewidth=0.8
+)
+
+# -------------------------------------------------------------
+# Styling
+# -------------------------------------------------------------
+ax.set_title(
+    "Facility Composition within 1500 ft of Top 5 Priority Tracts",
+    fontsize=14,
+    pad=12,
+)
+ax.set_xlabel("Tract (Borough - Name)", fontsize=11)
+ax.set_ylabel("Number of Facilities", fontsize=11)
+
+plt.xticks(rotation=35, ha="right")
+
+# Clean modern look
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+
+# Legend styling
+ax.legend(
+    title="Facility Type",
+    frameon=True,
+    facecolor="white",
+    edgecolor="#d8d8d8",
+    loc="upper left",
+    bbox_to_anchor=(1.02, 1.0)
+)
+
+plt.tight_layout()
+plt.show()
+```
+
+### Before vs After: Distance Improvement for Top 5 Priority Tracts
+
+For each of the Top 5 priority tracts, we compare two measures of restroom accessibility:
+
+- **Before**: the distance from each tract’s centroid to the *nearest existing* public restroom  
+- **After**: the distance from each centroid to the *recommended new restroom site*  
+  derived from the p-median optimization model  
+
+This comparison quantifies how much accessibility would improve if a restroom were installed at the
+optimized location within each tract.
+
+
+```{python}
+cols_to_merge = ["GEOID", "Priority_Score", "nearest_restroom_dist"]
+
+cols_to_drop = [c for c in ["Priority_Score", "nearest_restroom_dist"] if c in tracts_top5.columns]
+tracts_top5 = tracts_top5.drop(columns=cols_to_drop)
+
+# Merge the new information in
+tracts_top5 = (
+    tracts_top5
+    .merge(df[cols_to_merge], on="GEOID", how="left")
+    .sort_values("Priority_Score", ascending=False)
+)
+```
+
+```{python}
+# Make sure both are in the same CRS (feet)
+tracts5 = tracts_top5.to_crs(2263)
+candidates_2263 = candidate_sites.to_crs(2263)
+
+before = tracts5["nearest_restroom_dist"].values  
+
+after = []
+labels = []
+
+for idx, row in tracts5.iterrows():
+    geoid = row["GEOID"]
+    # candidate site
+    cand = candidates_2263[candidates_2263["GEOID"] == geoid]
+    if cand.empty:
+        after.append(np.nan)
+    else:
+        dist = row.geometry.centroid.distance(cand.geometry.iloc[0])
+        after.append(dist)
+
+    if "borough" in tracts5.columns and "NAMELSAD" in tracts5.columns:
+        labels.append(f"{row['borough']} - {row['NAMELSAD']}")
+    else:
+        labels.append(geoid)
+
+compare_df = pd.DataFrame({
+    "label": labels,
+    "before_ft": before,
+    "after_ft": after,
+})
+```
+
+
+
+```{python}
+sns.set_theme(style="whitegrid", context="notebook")
+plt.rcParams.update({
+    "figure.facecolor": "#edf0f5",
+    "axes.facecolor": "#edf0f5",
+    "grid.color": "white",
+    "grid.linewidth": 1.2,
+    "axes.edgecolor": "#d8d8d8",
+    "axes.linewidth": 1.0,
+})
+
+fig, ax = plt.subplots(figsize=(10, 6))
+
+y = np.arange(len(compare_df))
+
+for i, row in compare_df.iterrows():
+    # line between before and after
+    ax.plot(
+        [row["before_ft"], row["after_ft"]],
+        [y[i], y[i]],
+        color="#b0b0b0",
+        linewidth=2,
+        zorder=1,
+    )
+    # before point
+    ax.scatter(
+        row["before_ft"], y[i],
+        color="#e57373", s=70,
+        label="Before" if i == 0 else "",
+        zorder=2,
+    )
+    # after point
+    ax.scatter(
+        row["after_ft"], y[i],
+        color="#64b5f6", s=70,
+        label="After" if i == 0 else "",
+        zorder=3,
+    )
+
+ax.set_yticks(y)
+ax.set_yticklabels(compare_df["label"], fontsize=9)
+ax.set_xlabel("Distance to Nearest Restroom (ft)")
+ax.set_title("Before vs After: Distance to Nearest Public Restroom\nTop 5 Priority Tracts",
+             fontsize=13, pad=12)
+
+ax.legend(loc="lower right")
+ax.grid(axis="x", linestyle="--", alpha=0.6)
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+
+plt.tight_layout()
+plt.show()
+```
+
+
+```{python}
+# -----------------------------
+# 0) Load priority CSV
+# -----------------------------
+df = pd.read_csv("NYC_Public_Restroom_Priority_Score.csv", dtype={"GEOID": str})
+
+# Top5 GEOID
+top5_ids = (
+    df[df["Priority_Class"] == 1]
+    .sort_values("Priority_Score", ascending=False)
+    .head(5)["GEOID"]
+    .tolist()
+)
+
+# -----------------------------
+# 1) Load SHP + merge needed cols
+# -----------------------------
+tracts = gpd.read_file("tl_2023_36_tract/tl_2023_36_tract.shp")
+NYC_COUNTIES = {"005", "047", "061", "081", "085"}
+
+tracts = tracts[
+    (tracts["STATEFP"] == "36") &
+    (tracts["COUNTYFP"].isin(NYC_COUNTIES))
+].copy()
+tracts = tracts.to_crs(2263)
+tracts["GEOID"] = tracts["GEOID"].astype(str)
+
+cols_to_merge = ["GEOID", "Priority_Score", "nearest_restroom_dist", "borough", "tract_name"]
+tracts_top5 = (
+    tracts[tracts["GEOID"].isin(top5_ids)]
+    .merge(df[cols_to_merge], on="GEOID", how="left")
+    .sort_values("Priority_Score", ascending=False)
+)
+
+# -----------------------------
+# 2) BEFORE distance
+# -----------------------------
+before = tracts_top5["nearest_restroom_dist"].values
+
+# Convert candidate sites to feet CRS
+tracts5 = tracts_top5.to_crs(2263)
+candidates_2263 = candidate_sites.to_crs(2263)
+
+# -----------------------------
+# 3) AFTER distance
+# -----------------------------
+after = []
+
+for idx, row in tracts5.iterrows():
+    geoid = row["GEOID"]
+    cand = candidates_2263[candidates_2263["GEOID"] == geoid]
+
+    if cand.empty:
+        after.append(np.nan)
+    else:
+        dist = row.geometry.centroid.distance(cand.geometry.iloc[0])
+        after.append(dist)
+
+# -----------------------------
+# 4) Build final improvement table
+# -----------------------------
+compare_df = pd.DataFrame({
+    "GEOID": tracts_top5["GEOID"].values,
+    "borough": tracts_top5["borough"].values,
+    "tract_name": tracts_top5["tract_name"].values,
+    "Priority_Score": tracts_top5["Priority_Score"].values,
+    "before_ft": before,
+    "after_ft": after,
+})
+
+compare_df["diff_ft"] = compare_df["before_ft"] - compare_df["after_ft"]
+compare_df["improvement_pct"] = (compare_df["diff_ft"] / compare_df["before_ft"]) * 100
+
+compare_df["improvement_pct"] = compare_df["improvement_pct"].round(1).astype(str) + "%"
+
+compare_df = compare_df.sort_values("Priority_Score", ascending=False).reset_index(drop=True)
+compare_df
+```
+
+## Conclusion: Prioritizing Restroom Accessibility in New York City
+
+This project analyzed public restroom accessibility across **New York City’s 1,600+ census tracts**
+using population data, restroom distribution, and spatial accessibility metrics.  
+The results highlight substantial geographic inequities in restroom availability and identify
+specific areas where new facilities would provide the greatest benefit.
+
+### 1. Severe Spatial Inequality in Public Restroom Access
+
+- A very small number of tracts contain exceptionally high restroom counts.  
+  For example, **Manhattan’s Census Tract 143 (the southeastern section of Central Park)** contains **42 public restrooms**,  making it the most extreme outlier in the entire city.
+
+- These restroom-rich tracts are typically located within **large parks, major tourist attractions, or waterfront recreation zones**,  rather than in residential neighborhoods where everyday needs occur.
+
+- Correlation analysis confirms that restroom availability is **not well aligned with population density or residential demand**.  Even densely populated tracts often remain far from the nearest public restroom, indicating a spatial mismatch in resource allocation.
+
+
+
+### 2. Priority Score Identifies the Most Underserved Areas
+
+The composite **Priority Score**—constructed from  
+- **population density**,  
+- **distance to the nearest public restroom**, and  
+- **people-per-restroom ratios**,  
+
+pinpoints the census tracts where restroom scarcity is most acute.
+
+The resulting **Top 5 Priority Tracts** share several conditions:
+
+- **High residential population density**, indicating concentrated daily need  
+- **Long travel distances** to reach the nearest existing restroom  
+- **Minimal or no restroom infrastructure**, despite high demand  
+
+Together, these factors reveal neighborhoods where public restroom investment would have the greatest equity impact.
+
+
+### 3. Surrounding Facility Analysis Reveals High Local Demand
+
+A 1500-ft buffer analysis around each of the Top 5 priority tracts shows that they are surrounded by a diverse mix of community facilities, including:
+
+- **Major transit hubs** (subway stations and bus stops)  
+- **Schools** and other youth-serving institutions  
+- **Social service facilities**  
+- **NYCHA residential developments**  
+- **Local parks** with consistent foot traffic  
+
+These facilities represent populations with **high restroom need**—  
+**commuters, students, low-income households, park users, and individuals accessing social services**.
+
+The stacked bar chart illustrates that each tract has a **unique combination of facility-driven demand**, highlighting the importance of **tract-specific planning** rather than a one-size-fits-all approach.
+
+
+### 4. Optimal Restroom Locations Identified via the p-Median Model
+
+Using a grid-based **p-median optimization (p = 1)** for each of the Top 5 tracts, the study computes the restroom location that minimizes total walking distance to nearby high-demand facilities.  
+
+The model applies weighted demand based on facility importance:
+
+- **Social service facilities** — *3.5*  
+- **Schools** — *3.0*  
+- **NYCHA housing** — *2.5*  
+- **Subway stations** — *2.0*  
+- **Parks** — *1.5*  
+- **Bus stops** — *1.0*  
+
+By evaluating candidate points every 200 ft inside each tract boundary, the model identifies **precise recommended restroom coordinates** for all five priority tracts.
+
+These optimal locations are those that **minimize total weighted travel distance** for the largest number of high-need users, offering an evidence-based foundation for equitable restroom placement.
+
+
+### 5. Significant Accessibility Improvements
+
+A comparison of **Before vs. After** distances shows substantial gains across all priority tracts:
+
+- **66%–86% reduction** in distance to the nearest restroom  
+- Residents would be able to reach a restroom **2–5× faster** than before  
+
+These results demonstrate that **optimized restroom siting**—not merely adding more restrooms—can dramatically enhance real-world accessibility, especially in neighborhoods with historically limited public restroom coverage.
+
+
+---
+
+## Final Takeaway
+
+NYC’s current restroom network is **uneven, tourism-oriented, and spatially imbalanced**, leaving many
+residential neighborhoods underserved.  
+By combining population indicators, accessibility modeling, contextual facility analysis, and p-median optimization,
+this study identifies where new restroom investments would have the most meaningful impact.
+
+Installing restrooms at the optimized locations would **dramatically improve accessibility**,
+strengthen public health, and advance **sanitation equity** for communities across the city.
+
+---
+## Limitations
+
+Despite providing a comprehensive spatial assessment of restroom accessibility in New York City, this study has several important limitations:
+
+### 1. Dataset Completeness and Accuracy
+- Public restroom datasets may omit temporary, seasonal, or privately managed restrooms.
+- Some facility datasets (e.g., social services, NYCHA, schools) may contain geocoding errors or inconsistent update cycles.
+
+### 2. Tract-Level Resolution
+- Census tracts are large and internally heterogeneous; accessibility can vary sharply within the same tract.
+- Using tract centroids to measure distances does not reflect realistic walking paths.
+
+### 3. Euclidean Distance Assumption
+- Distances were computed using straight-line (Euclidean) distance rather than network-based walking distance.
+- Actual pedestrian access may be longer due to road layouts, barriers, or restricted access points.
+
+### 4. Assumed Facility Weights in the p-Median Model
+- Facility weights (e.g., social services = 3.5, schools = 3.0) are informed by equity principles but remain subjective.
+- Different weighting choices could produce different “optimal” restroom locations.
+
+### 5. Grid Resolution for Candidate Points
+- The p-median model uses a 200-ft grid, which offers tract-level estimation but lacks fine-grained precision for micro-siting.
+- Smaller grid sizes would improve accuracy but substantially increase computational cost.
+
+### 6. Lack of Temporal Dynamics
+- The analysis does not incorporate time-dependent variation in restroom demand (weekday vs weekend, school hours, seasonal tourism).
+- Demand near transit hubs, parks, and schools changes significantly throughout the day and year.
+
+### 7. Limited Equity Variables
+- While population density and facility context were included, other equity-related factors  
+  (e.g., disability access needs, unhoused population presence, socioeconomic vulnerability)  
+  were **not explicitly included** due to data limitations.
+
+---
+
+## Future Research Directions
+
+Building on the limitations identified above, several extensions can further enhance the 
+accuracy, equity relevance, and policy usefulness of this analysis:
+
+1. **Road-Network–Based Accessibility Modeling**  
+   - Future work could replace straight-line (Euclidean) distance with *network-based walking distance*  
+     using OpenStreetMap or NYC DOT pedestrian networks.  
+   - This would provide more realistic estimates of restroom access in dense urban environments.
+
+2. **Temporal Dynamics of Restroom Demand**  
+   - Incorporating time-dependent patterns—weekday vs. weekend travel, seasonal tourism, school hours,  
+     and peak transit times—would better capture fluctuating restroom needs across neighborhoods.
+
+3. **Expanded Equity and Vulnerability Indicators**  
+   - Additional equity variables such as disability access needs, unhoused population density,  
+     senior population concentration, or socioeconomic vulnerability could be included once data are available.  
+   - This would help align restroom planning more directly with public-health equity outcomes.
+
+4. **Fine-Grained Micro-Siting with Higher-Resolution Grids**  
+   - Moving from a 200-ft grid to a finer grid (e.g., 50–100 ft) could identify more precise  
+     restroom locations, especially in irregular or high-demand urban blocks.  
+   - Computational optimization techniques (e.g., heuristics, GPU computation) may support this improvement.
+
+5. **Integration of Pedestrian Traffic and Mobility Data**  
+   - Future studies could incorporate pedestrian counts, mobility traces, or SafeGraph/Google mobility data  
+     to directly quantify real-world foot traffic around candidate sites.
+
+6. **Community and Stakeholder-Informed Siting**  
+   - Engagement with community groups, NYCHA residents, social-service providers, and local businesses  
+     could supplement quantitative siting models with qualitative, on-the-ground insight.
+
+7. **Scenario Testing for Policy and Maintenance Planning**  
+   - Future work could simulate different deployment scenarios (e.g., “tourist season expansion,”  
+     “nighttime access,” “school-day peak”) to test robustness of optimal sites under varied conditions.
+
+---
+
+
+::: {.callout title="References" icon="book"}
+NYC Department of Health and Mental Hygiene. (2019).  
+*Public health and access to restrooms in New York City.*  
+New York, NY: NYC DOHMH.
+
+NYC Department of Homeless Services. (2021).  
+*Local Law 47 shelter access and service utilization report.*  
+New York, NY: NYC DHS.
+
+NYC Independent Budget Office. (2023).  
+*Not in service: Public bathroom availability and equity across New York City.*  
+New York, NY: NYC IBO.
+
+Grier, S., & Perry, V. (2018).  
+Public health challenges in underserved urban neighborhoods:  
+A sanitation and infrastructure perspective.  
+*Journal of Urban Health, 95*(5), 655–667.
+
+U.S. Environmental Protection Agency. (2020).  
+*Healthy school environments and student well-being: A national review.*  
+Washington, DC: U.S. EPA.
+
+UN-Habitat. (2020).  
+*Global guidelines for inclusive public sanitation.*  
+United Nations Human Settlements Programme.
+:::
+
