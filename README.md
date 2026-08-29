@@ -6,7 +6,7 @@ A geospatial analysis of public restroom accessibility across New York City, com
 
 For the complete analysis, including Python code, methodology, visualizations, and interactive maps:
 
-[**View Full Interactive Analysis**](YOUR_HTML_URL_HERE)
+[**View Full Interactive Analysis**](https://chaeyeonlee01.github.io/nyc-restroom-accessibility-optimization/)
 
 ---
 
